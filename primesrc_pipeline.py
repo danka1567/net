@@ -31,6 +31,28 @@ from urllib.request import Request, urlopen
 warnings.filterwarnings("ignore", category=ResourceWarning)
 
 # ═══════════════════════════════════════════════════════════════
+# PLAYWRIGHT AUTO-INSTALL
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    from playwright.async_api import async_playwright as _pw_check  # noqa: F401
+    _PLAYWRIGHT_AVAILABLE = True
+except ModuleNotFoundError:
+    _PLAYWRIGHT_AVAILABLE = False
+    _pw_check = None
+
+def _ensure_playwright():
+    """Install playwright + chromium browser if not already present."""
+    global _PLAYWRIGHT_AVAILABLE
+    if _PLAYWRIGHT_AVAILABLE:
+        return
+    print("[INFO]  playwright not found — installing now...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "playwright", "--quiet"])
+    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium", "--with-deps"])
+    _PLAYWRIGHT_AVAILABLE = True
+    print("[OK]    playwright installed successfully")
+
+# ═══════════════════════════════════════════════════════════════
 # PATHS & TUNABLES
 # ═══════════════════════════════════════════════════════════════
 
@@ -273,7 +295,8 @@ def _bb_stop_session(api_key, session_id):
 
 async def _extract_urls_browserbase(api_urls, args):
     """Use Playwright to connect to Browserbase and extract stream URLs."""
-    from playwright.async_api import async_playwright  # type: ignore
+    _ensure_playwright()
+    from playwright.async_api import async_playwright
 
     bb_api_key    = os.environ["BROWSERBASE_API_KEY"].strip()
     bb_project_id = os.environ["BROWSERBASE_PROJECT_ID"].strip()
@@ -862,6 +885,7 @@ async def _run(args):
     bb_pid = os.environ.get("BROWSERBASE_PROJECT_ID", "")
     if bb_key and bb_pid:
         log_ok("Browserbase credentials found — Playwright cloud browser will be used")
+        _ensure_playwright()
     else:
         log_warn("No Browserbase credentials — falling back to local Chrome (nodriver)")
 
