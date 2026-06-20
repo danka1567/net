@@ -82,12 +82,19 @@ else:
 CHROME_DEBUG_PORT    = 9222
 CHROME_PROFILE_CACHE = os.path.join(tempfile.gettempdir(), "primesrc_profile_cache")
 
+# Request timing & rate limiting
 STAGE1_REQUEST_TIMEOUT = 20
 STAGE2_PAGE_TIMEOUT    = 60
 STAGE2_BLANK_TIMEOUT   = 1
 STAGE2_BATCH_SIZE      = 5
 STAGE2_RELOADS         = 2
 STAGE2_FINAL_RETRIES   = 1
+
+# Rate limiting settings (to avoid being blocked)
+STAGE2_REQUEST_DELAY      = 0.5   # Base delay between requests (seconds)
+STAGE2_RETRY_DELAY        = 2.0   # Delay between retry attempts (seconds)
+STAGE2_ERROR_BACKOFF      = 1.5   # Multiplier for error backoff
+STAGE2_MAX_ERROR_DELAY    = 10.0  # Maximum delay on consecutive errors (seconds)
 
 CACHE_NAMES = {
     "AutofillAiModelCache", "Cache", "CacheStorage", "Code Cache",
@@ -312,6 +319,8 @@ async def _extract_urls_browserbase(api_urls, args):
     log_info(f"  Session: {session_id}")
 
     results = []
+    consecutive_errors = 0
+    error_delay = STAGE2_RETRY_DELAY  # Use configurable constant
 
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(ws_url)
@@ -323,12 +332,20 @@ async def _extract_urls_browserbase(api_urls, args):
             label = f"[{idx:>3}/{len(api_urls)}]"
             print(f"{label} → {api_url}")
 
+            # Add delay to avoid rate limiting (more delay after consecutive errors)
+            if idx > 1:
+                base_delay = STAGE2_REQUEST_DELAY if consecutive_errors == 0 else min(error_delay, STAGE2_MAX_ERROR_DELAY)
+                await asyncio.sleep(base_delay)
+
             extracted_url = None
             last_error    = None
+            raw_content   = None  # Store for debugging
 
             for attempt in range(args.reloads + 1):
                 if attempt:
                     print(f"{label} ↻ reload {attempt}/{args.reloads}")
+                    # Longer delay between retries
+                    await asyncio.sleep(STAGE2_RETRY_DELAY)
 
                 page = await context.new_page()
                 try:
@@ -346,7 +363,11 @@ async def _extract_urls_browserbase(api_urls, args):
                             if text and text[0] in "{[":
                                 break
                             title = await page.title()
-                            if "Just a moment" not in title and text:
+                            # Check for Cloudflare or bot detection
+                            if any(indicator in title.lower() for indicator in ["just a moment", "checking your browser", "cloudflare"]):
+                                await asyncio.sleep(1)  # Wait longer for challenge
+                                continue
+                            if text:
                                 break
                         except Exception:
                             pass
@@ -358,12 +379,16 @@ async def _extract_urls_browserbase(api_urls, args):
                         except Exception:
                             pass
 
+                    raw_content = text  # Store for error reporting
+
                     if text:
                         data = extract_json(text)
                         play_url = get_play_url(data)
                         if play_url:
                             print(f"{label} ✓ {play_url}")
                             extracted_url = play_url
+                            consecutive_errors = 0  # Reset error counter
+                            error_delay = STAGE2_RETRY_DELAY  # Reset delay
                             break
                         else:
                             last_error = "no URL in response"
@@ -375,6 +400,14 @@ async def _extract_urls_browserbase(api_urls, args):
                 except Exception as e:
                     last_error = str(e)
                     print(f"{label} ✗ {last_error}")
+                    
+                    # Detect rate limiting or blocking
+                    if any(indicator in last_error.lower() for indicator in 
+                           ["rate limit", "too many requests", "cloudflare", "html", "error page"]):
+                        consecutive_errors += 1
+                        error_delay = min(error_delay * STAGE2_ERROR_BACKOFF, STAGE2_MAX_ERROR_DELAY)  # Exponential backoff
+                        print(f"{label} ⚠ Possible rate limit detected, adding {error_delay:.1f}s delay")
+                        await asyncio.sleep(error_delay)
                 finally:
                     try:
                         await page.close()
@@ -386,6 +419,7 @@ async def _extract_urls_browserbase(api_urls, args):
                 "api_url":       api_url,
                 "extracted_url": extracted_url,
                 "error":         last_error if not extracted_url else None,
+                "raw_content_preview": (raw_content or "")[:300] if not extracted_url else None,
             })
 
         await browser.close()
@@ -485,16 +519,43 @@ async def _wait_for_debug_endpoint(port, timeout=45):
 
 
 def extract_json(text):
+    """Extract and parse JSON from page content with robust error handling."""
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty page content")
+    
+    # Check for common error pages first
+    lower_text = text.lower()
+    if any(indicator in lower_text for indicator in [
+        "<!doctype html", "<html", "cloudflare", "access denied", 
+        "rate limit", "too many requests", "just a moment",
+        "checking your browser", "captcha", "challenge"
+    ]):
+        # Log a snippet for debugging
+        snippet = text[:200].replace('\n', ' ')
+        raise ValueError(f"Received HTML/error page instead of JSON: {snippet}...")
+    
+    # Try direct JSON parse if it looks like JSON
     if text[0] in "{[":
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            # Log the error with context
+            snippet = text[:500].replace('\n', ' ')
+            raise ValueError(f"Invalid JSON at position {e.pos}: {snippet}...")
+    
+    # Try to extract JSON from embedded content
     s = text.find("{")
     e = text.rfind("}") + 1
     if s == -1 or e <= s:
-        raise ValueError("No JSON object found in page")
-    return json.loads(text[s:e])
+        snippet = text[:200].replace('\n', ' ')
+        raise ValueError(f"No JSON object found in page: {snippet}...")
+    
+    try:
+        return json.loads(text[s:e])
+    except json.JSONDecodeError as e:
+        snippet = text[max(0, s):min(len(text), e)][:500].replace('\n', ' ')
+        raise ValueError(f"Invalid JSON in extracted portion at position {e.pos}: {snippet}...")
 
 
 def get_play_url(data):
@@ -564,6 +625,11 @@ async def extract_one_nodriver(browser, api_url, timeout, blank_timeout, reloads
     async with sem:
         label = f"[{index:>3}/{total}]"
         await safe_print(f"{label} → {api_url}")
+        
+        # Add small delay to avoid rate limiting
+        if index > 1:
+            await asyncio.sleep(STAGE2_REQUEST_DELAY)
+        
         try:
             page = await browser.get(api_url, new_tab=True)
         except Exception as e:
@@ -571,17 +637,20 @@ async def extract_one_nodriver(browser, api_url, timeout, blank_timeout, reloads
             return {"index": index, "api_url": api_url, "error": str(e), "extracted_url": None}
 
         last_error = None
+        raw_content = None
         try:
             for attempt in range(reloads + 1):
                 if attempt:
                     await safe_print(f"{label} ↻ reload {attempt}/{reloads}")
                     await page.reload(ignore_cache=True)
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(STAGE2_RETRY_DELAY)  # Use constant
                 try:
-                    text     = await wait_for_json_fast(page, timeout=timeout, blank_timeout=blank_timeout)
+                    text = await wait_for_json_fast(page, timeout=timeout, blank_timeout=blank_timeout)
                     if not text or text[0] not in "{[":
                         text = await page.evaluate("document.body.innerHTML")
-                    data     = extract_json(text)
+                    
+                    raw_content = text  # Store for debugging
+                    data = extract_json(text)
                     play_url = get_play_url(data)
                     if play_url:
                         await safe_print(f"{label} ✓ {play_url}")
@@ -591,7 +660,19 @@ async def extract_one_nodriver(browser, api_url, timeout, blank_timeout, reloads
                 except Exception as e:
                     last_error = str(e)
                     await safe_print(f"{label} ✗ {last_error}")
-            return {"index": index, "api_url": api_url, "error": last_error or "failed", "extracted_url": None}
+                    
+                    # Add delay on rate limit errors
+                    if any(indicator in last_error.lower() for indicator in 
+                           ["rate limit", "html", "error page", "cloudflare"]):
+                        await asyncio.sleep(STAGE2_RETRY_DELAY * 1.5)
+            
+            return {
+                "index": index, 
+                "api_url": api_url, 
+                "error": last_error or "failed", 
+                "extracted_url": None,
+                "raw_content_preview": (raw_content or "")[:300] if raw_content else None,
+            }
         finally:
             try:
                 await page.close()
@@ -678,13 +759,30 @@ async def stage2_extract_stream_urls(api_list_file, stream_out_file, args):
         if item.get("extracted_url"):
             log_ok(item["extracted_url"])
         else:
-            log_err(f"FAILED : {item['api_url']}  ({item.get('error', 'no URL')})")
+            error_msg = item.get('error', 'no URL')
+            # Show content preview for debugging if available
+            if item.get('raw_content_preview'):
+                preview = item['raw_content_preview'].replace('\n', ' ')[:150]
+                log_err(f"FAILED : {item['api_url']}  ({error_msg}) - Preview: {preview}")
+            else:
+                log_err(f"FAILED : {item['api_url']}  ({error_msg})")
 
     log_info(f"Success : {len(ok)} / {len(results)}    Failed : {len(fails)}")
-
+    
+    # Save successful URLs
     stream_out_file.write_text(
         "\n".join(r["extracted_url"] for r in ok) + "\n", encoding="utf-8"
     )
+    
+    # Save failed URLs for retry
+    if fails:
+        failed_file = stream_out_file.parent / "failed_api_urls.txt"
+        failed_content = "\n".join(
+            f"{r['api_url']} # {r.get('error', 'unknown')}" for r in fails
+        ) + "\n"
+        failed_file.write_text(failed_content, encoding="utf-8")
+        log_info(f"Failed URLs saved to {failed_file} for later retry")
+    
     return results
 
 
