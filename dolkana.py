@@ -78,9 +78,9 @@ CHROME_DEBUG_PORT    = 9222
 CHROME_PROFILE_CACHE = os.path.join(tempfile.gettempdir(), "primesrc_profile_cache")
 
 STAGE1_REQUEST_TIMEOUT = 20   # urllib timeout per /api/v1/s call
-STAGE2_PAGE_TIMEOUT    = 45   # seconds to wait for JSON per tab
+STAGE2_PAGE_TIMEOUT    = 120   # seconds to wait for JSON per tab
 STAGE2_BLANK_TIMEOUT   = 1    # seconds before deciding tab is stalled blank
-STAGE2_BATCH_SIZE      = 5    # concurrent tabs
+STAGE2_BATCH_SIZE      = 1    # concurrent tabs
 STAGE2_RELOADS         = 2    # reload retries per failed tab
 STAGE2_FINAL_RETRIES   = 1    # extra full retry passes for still-failed keys
 
