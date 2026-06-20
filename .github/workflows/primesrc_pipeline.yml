@@ -1,167 +1,118 @@
-name: PrimeSrc Pipeline
+name: PrimeSrc Pipeline (Browserbase)
 
 on:
   workflow_dispatch:
     inputs:
-      skip_stage1:
-        description: 'Skip Stage 1 (use existing api_url_list.txt)'
-        required: false
-        type: boolean
-        default: false
-      skip_stage2:
-        description: 'Skip Stage 2 (only collect keys, no Chrome)'
-        required: false
-        type: boolean
-        default: false
       media_type:
-        description: 'Media type (movie or tv)'
+        description: "Media type"
         required: false
+        default: "movie"
         type: choice
-        options:
-          - movie
-          - tv
-        default: movie
-  schedule:
-    # Run daily at 00:00 UTC (adjust as needed)
-    - cron: '0 0 * * *'
-  push:
-    branches:
-      - main
-    paths:
-      - 'dolkana.py'
-      - '.github/workflows/primesrc-pipeline.yml'
-      - 'multiple_primesrc.txt'
+        options: [movie, tv]
+      skip_stage1:
+        description: "Skip Stage 1 (reuse existing api_url_list.txt)"
+        required: false
+        default: false
+        type: boolean
+      skip_stage2:
+        description: "Skip Stage 2 (keys only, no browser)"
+        required: false
+        default: false
+        type: boolean
+
+  # Uncomment to run on a schedule:
+  # schedule:
+  #   - cron: "0 2 * * *"   # 2 AM UTC daily
 
 jobs:
-  extract-urls:
+  run-pipeline:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 60
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-      
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@latest
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install nodriver
+
+      - name: Restore previous pipeline_summary (for merging)
+        uses: actions/download-artifact@v4
         with:
-          chrome-version: stable
-      
-      - name: Verify Chrome installation
-        run: |
-          which google-chrome || which chrome || which chromium
-          google-chrome --version || chrome --version || chromium --version
-          
-          # Test Chrome can start with debug port
-          google-chrome --headless --disable-gpu --remote-debugging-port=9333 --no-sandbox about:blank &
-          CHROME_PID=$!
-          sleep 3
-          
-          # Check if debug endpoint is accessible
-          curl -s http://127.0.0.1:9333/json/version || echo "Warning: Chrome debug port test failed"
-          
-          # Kill test Chrome
-          kill $CHROME_PID 2>/dev/null || true
-          sleep 1
-      
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install nodriver
-      
-      - name: Create input file if not exists
-        run: |
-          if [ ! -f "multiple_primesrc.txt" ]; then
-            echo "# Add your PrimeSrc embed URLs here, one per line" > multiple_primesrc.txt
-            echo "# Example: https://primesrc.me/embed/movie?tmdb=12345" >> multiple_primesrc.txt
-          fi
-      
-      - name: Setup display for Chrome
-        run: |
-          # Install xvfb for headless display
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          
-          # Start virtual display
-          Xvfb :99 -ac -screen 0 1280x1024x24 &
-          sleep 2
-      
-      - name: Create Chrome profile directory
-        run: |
-          mkdir -p ~/.config/google-chrome/Default
-          echo "{}" > ~/.config/google-chrome/Default/Preferences
-          mkdir -p ~/.config/google-chrome/Default/Cache
-      
-      - name: Run PrimeSrc Pipeline
-        run: |
-          # Build command with optional flags
-          CMD="python dolkana.py --refresh-profile"
-          
-          if [ "${{ github.event.inputs.skip_stage1 }}" == "true" ]; then
-            CMD="$CMD --skip-stage1"
-          fi
-          
-          if [ "${{ github.event.inputs.skip_stage2 }}" == "true" ]; then
-            CMD="$CMD --skip-stage2"
-          fi
-          
-          if [ -n "${{ github.event.inputs.media_type }}" ]; then
-            CMD="$CMD --type ${{ github.event.inputs.media_type }}"
-          fi
-          
-          # Run the pipeline
-          $CMD
-        env:
-          # Set Chrome path for Linux
-          CHROME_EXE: /usr/bin/google-chrome
-          # Set display for xvfb
-          DISPLAY: :99
+          name: pipeline-summary
+          path: .
         continue-on-error: true
-      
-      - name: Upload API URL list
-        if: always()
-        uses: actions/upload-artifact@v4
+
+      - name: Restore api_url_list (if skip-stage1)
+        if: ${{ inputs.skip_stage1 == true }}
+        uses: actions/download-artifact@v4
         with:
           name: api-url-list
-          path: api_url_list.txt
-          if-no-files-found: ignore
-      
-      - name: Upload stream URLs
+          path: .
+        continue-on-error: true
+
+      - name: Run PrimeSrc pipeline
+        env:
+          BROWSERBASE_API_KEY: ${{ secrets.BROWSERBASE_API_KEY }}
+          BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
+        run: |
+          ARGS="--type ${{ inputs.media_type || 'movie' }}"
+          if [ "${{ inputs.skip_stage1 }}" = "true" ]; then
+            ARGS="$ARGS --skip-stage1"
+          fi
+          if [ "${{ inputs.skip_stage2 }}" = "true" ]; then
+            ARGS="$ARGS --skip-stage2"
+          fi
+          echo "Running: python primesrc_pipeline.py $ARGS"
+          python primesrc_pipeline.py $ARGS
+
+      - name: Show result summary
+        if: always()
+        run: |
+          echo "=== final_stream_urls.txt ==="
+          [ -f final_stream_urls.txt ] && cat final_stream_urls.txt || echo "(not found)"
+          echo ""
+          echo "=== pipeline_summary.json (first 50 lines) ==="
+          [ -f pipeline_summary.json ] && head -50 pipeline_summary.json || echo "(not found)"
+
+      - name: Upload final_stream_urls
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: final-stream-urls
           path: final_stream_urls.txt
-          if-no-files-found: ignore
-      
-      - name: Upload JSON summary
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload api_url_list
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-url-list
+          path: api_url_list.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload pipeline_summary (pretty JSON)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: pipeline-summary
-          path: |
-            pipeline_summary.json
-            pipeline_summary.gz.json
-          if-no-files-found: ignore
-      
-      - name: Upload HTML report
+          path: pipeline_summary.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Upload pipeline_summary (compressed)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-report
-          path: pipeline_report.html
-          if-no-files-found: ignore
-      
-      - name: Commit and push results (optional)
-        if: success()
-        run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          git add -f api_url_list.txt final_stream_urls.txt pipeline_summary.json pipeline_summary.gz.json || true
-          git diff --staged --quiet || git commit -m "Update PrimeSrc pipeline results [skip ci]"
-          git push || true
-        continue-on-error: true
+          name: pipeline-summary-gz
+          path: pipeline_summary.gz.json
+          if-no-files-found: warn
+          retention-days: 90
