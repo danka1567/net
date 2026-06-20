@@ -1,24 +1,10 @@
-
+#!/usr/bin/env python3
 """
-primesrc_pipeline.py  –  Unified PrimeSrc pipeline
-====================================================
-
-Stage 1  (primesrcembed.py logic)
-    Read multiple_primesrc.txt  →  fetch /api/v1/s for every tmdb embed URL
-    →  collect all server option keys  →  write api_url_list.txt
-
-Stage 2  (extract_primesrc_urls.py logic  — copied verbatim and integrated)
-    Read api_url_list.txt  →  open every /api/v1/l?key=… in Chrome via nodriver
-    using new_tab=True, wait_for_json_fast poller, reload-on-blank strategy
-    →  extract stream / embed link URL  →  write final_stream_urls.txt
-
-Extras
-  - Single CLI entry point, no manual hand-off between scripts
-  - Stage 1 uses plain urllib (no browser overhead)
-  - --skip-stage1 / --skip-stage2 for incremental runs
-  - Deduplication of keys before Chrome is launched
-  - JSON summary + dark HTML report written at the end
-  - Graceful Ctrl-C at any stage
+primesrc_pipeline.py  –  Unified PrimeSrc pipeline (Browserbase edition)
+=========================================================================
+Stage 1  – fetch /api/v1/s for every tmdb embed URL → api_url_list.txt
+Stage 2  – open every /api/v1/l?key=… via Browserbase cloud browser
+           (falls back to local Chrome if no BB credentials)
 """
 
 from __future__ import annotations
@@ -51,38 +37,38 @@ warnings.filterwarnings("ignore", category=ResourceWarning)
 # ═══════════════════════════════════════════════════════════════
 
 HERE                 = Path(__file__).parent
-DEFAULT_INPUT_FILE   = HERE / "multiple_primesrc.txt" 
+DEFAULT_INPUT_FILE   = HERE / "multiple_primesrc.txt"
 DEFAULT_API_LIST     = HERE / "api_url_list.txt"
 DEFAULT_STREAM_OUT   = HERE / "final_stream_urls.txt"
 DEFAULT_JSON_SUMMARY = HERE / "pipeline_summary.json"
 DEFAULT_HTML_OUT     = HERE / "pipeline_report.html"
 
-# Platform-specific Chrome paths
+# Platform-specific Chrome paths (used only when Browserbase is not available)
 if sys.platform == "win32":
-    CHROME_EXE           = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    CHROME_EXE_ALT       = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-    CHROME_USER_DATA     = r"C:\Users\AC\AppData\Local\Google\Chrome\User Data"
-    CHROME_PROFILE       = "Profile 2"
-elif sys.platform == "darwin":  # macOS
-    CHROME_EXE           = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-    CHROME_EXE_ALT       = "/Applications/Chromium.app/Contents/MacOS/Chromium"
-    CHROME_USER_DATA     = os.path.expanduser("~/Library/Application Support/Google/Chrome")
-    CHROME_PROFILE       = "Default"
-else:  # Linux
-    CHROME_EXE           = "/usr/bin/google-chrome"
-    CHROME_EXE_ALT       = "/usr/bin/chromium-browser"
-    CHROME_USER_DATA     = os.path.expanduser("~/.config/google-chrome")
-    CHROME_PROFILE       = "Default"
+    CHROME_EXE       = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    CHROME_EXE_ALT   = r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+    CHROME_USER_DATA = r"C:\Users\AC\AppData\Local\Google\Chrome\User Data"
+    CHROME_PROFILE   = "Profile 2"
+elif sys.platform == "darwin":
+    CHROME_EXE       = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    CHROME_EXE_ALT   = "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    CHROME_USER_DATA = os.path.expanduser("~/Library/Application Support/Google/Chrome")
+    CHROME_PROFILE   = "Default"
+else:
+    CHROME_EXE       = "/usr/bin/google-chrome"
+    CHROME_EXE_ALT   = "/usr/bin/chromium-browser"
+    CHROME_USER_DATA = os.path.expanduser("~/.config/google-chrome")
+    CHROME_PROFILE   = "Default"
 
 CHROME_DEBUG_PORT    = 9222
 CHROME_PROFILE_CACHE = os.path.join(tempfile.gettempdir(), "primesrc_profile_cache")
 
-STAGE1_REQUEST_TIMEOUT = 20   # urllib timeout per /api/v1/s call
-STAGE2_PAGE_TIMEOUT    = 120   # seconds to wait for JSON per tab
-STAGE2_BLANK_TIMEOUT   = 1    # seconds before deciding tab is stalled blank
-STAGE2_BATCH_SIZE      = 1    # concurrent tabs
-STAGE2_RELOADS         = 2    # reload retries per failed tab
-STAGE2_FINAL_RETRIES   = 1    # extra full retry passes for still-failed keys
+STAGE1_REQUEST_TIMEOUT = 20
+STAGE2_PAGE_TIMEOUT    = 60
+STAGE2_BLANK_TIMEOUT   = 1
+STAGE2_BATCH_SIZE      = 5
+STAGE2_RELOADS         = 2
+STAGE2_FINAL_RETRIES   = 1
 
 CACHE_NAMES = {
     "AutofillAiModelCache", "Cache", "CacheStorage", "Code Cache",
@@ -92,6 +78,9 @@ CACHE_NAMES = {
 }
 
 TMDB_ID_RE = re.compile(r"^\d+$")
+
+# Browserbase API endpoint
+BROWSERBASE_API = "https://www.browserbase.com/v1"
 
 # ═══════════════════════════════════════════════════════════════
 # CONSOLE HELPERS
@@ -199,13 +188,13 @@ def _options_from_server_list(servers: list[dict], main_url: str) -> list[Server
         if not key:
             continue
         options.append(ServerOption(
-            server_name   = name,
-            key           = key,
-            api_url       = f"https://primesrc.me/api/v1/l?key={quote(key, safe='')}",
-            main_url      = main_url,
-            title         = str(item.get("file_name")       or "").strip(),
-            quality       = str(item.get("quality")         or "").strip(),
-            audio_language= str(item.get("audio_language")  or "").strip(),
+            server_name    = name,
+            key            = key,
+            api_url        = f"https://primesrc.me/api/v1/l?key={quote(key, safe='')}",
+            main_url       = main_url,
+            title          = str(item.get("file_name")      or "").strip(),
+            quality        = str(item.get("quality")        or "").strip(),
+            audio_language = str(item.get("audio_language") or "").strip(),
         ))
     return options
 
@@ -256,7 +245,6 @@ def stage1_fetch_api_keys(
             errors.append((embed_url, str(exc)))
             log_err(f"{label} {exc}  {embed_url}")
 
-    # Deduplicate by api_url
     seen_api: set[str] = set()
     unique_options: list[ServerOption] = []
     for opt in all_options:
@@ -281,14 +269,63 @@ def stage1_fetch_api_keys(
 
 
 # ═══════════════════════════════════════════════════════════════
-# STAGE 2  –  api_url_list.txt → Chrome (nodriver) → stream URLs
-#
-#  *** Logic copied directly from extract_primesrc_urls.py ***
-#  Key difference from previous attempt: browser.get(..., new_tab=True)
-#  and the wait_for_json_fast() 100ms-poll strategy from the original.
+# BROWSERBASE HELPERS
 # ═══════════════════════════════════════════════════════════════
 
-# ── Chrome management (identical to extract_primesrc_urls.py) ──
+def _bb_request(method: str, path: str, api_key: str, body: dict | None = None) -> dict:
+    """Make a request to the Browserbase API."""
+    url  = f"{BROWSERBASE_API}{path}"
+    data = json.dumps(body).encode() if body else None
+    req  = Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "x-bb-api-key": api_key,
+        },
+        method=method,
+    )
+    with urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def _bb_create_session(api_key: str, project_id: str) -> dict:
+    """Create a new Browserbase session with stealth settings."""
+    log_info("Creating Browserbase session...")
+    session = _bb_request(
+        "POST",
+        "/sessions",
+        api_key,
+        {
+            "projectId": project_id,
+            "browserSettings": {
+                "fingerprint": {
+                    "browsers":         ["chrome"],
+                    "devices":          ["desktop"],
+                    "operatingSystems": ["windows"],
+                    "locales":          ["en-US"],
+                },
+                "viewport": {"width": 1280, "height": 800},
+                "stealth": True,
+            },
+        },
+    )
+    log_ok(f"Browserbase session created: {session['id']}")
+    return session
+
+
+def _bb_stop_session(api_key: str, session_id: str) -> None:
+    """Stop a Browserbase session."""
+    try:
+        _bb_request("POST", f"/sessions/{session_id}", api_key, {"status": "REQUEST_RELEASE"})
+        log_info(f"Browserbase session released: {session_id}")
+    except Exception as e:
+        log_warn(f"Could not release Browserbase session: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# LOCAL CHROME HELPERS  (fallback when no Browserbase creds)
+# ═══════════════════════════════════════════════════════════════
 
 def _kill_chrome() -> None:
     subprocess.run(
@@ -326,17 +363,12 @@ def _remove_profile_lock(user_data_dir: str) -> None:
 
 
 def _get_chrome_exe() -> str:
-    # Check environment variable first (for CI/CD)
     env_chrome = os.environ.get("CHROME_EXE")
     if env_chrome and os.path.exists(env_chrome):
         return env_chrome
-    
-    # Check default locations
     for exe in (CHROME_EXE, CHROME_EXE_ALT):
         if os.path.exists(exe):
             return exe
-    
-    # Try common alternative paths
     common_paths = [
         "/usr/bin/chromium",
         "/snap/bin/chromium",
@@ -347,13 +379,11 @@ def _get_chrome_exe() -> str:
     for path in common_paths:
         if path and os.path.exists(path):
             return path
-    
     raise FileNotFoundError("Chrome not found at default locations.")
 
 
 def _copy_profile_for_automation(refresh: bool = False) -> str:
-    src = os.path.join(CHROME_USER_DATA, CHROME_PROFILE)
-    
+    src         = os.path.join(CHROME_USER_DATA, CHROME_PROFILE)
     dst_root    = CHROME_PROFILE_CACHE
     dst_profile = os.path.join(dst_root, CHROME_PROFILE)
 
@@ -367,35 +397,21 @@ def _copy_profile_for_automation(refresh: bool = False) -> str:
         return dst_root
 
     os.makedirs(dst_root, exist_ok=True)
-    
-    # Copy Local State if it exists
+
     local_state = os.path.join(CHROME_USER_DATA, "Local State")
     if os.path.exists(local_state):
         shutil.copy2(local_state, os.path.join(dst_root, "Local State"))
 
-    # Check if source profile exists
     if not os.path.isdir(src):
         log_warn(f"Chrome profile not found: {src}")
         log_info("Creating minimal Chrome profile for automation")
-        
-        # Create minimal profile structure
         os.makedirs(dst_profile, exist_ok=True)
-        
-        # Create minimal Preferences file
-        preferences = {
-            "profile": {
-                "exit_type": "Normal",
-                "exited_cleanly": True
-            }
-        }
         prefs_path = os.path.join(dst_profile, "Preferences")
         with open(prefs_path, "w", encoding="utf-8") as f:
-            json.dump(preferences, f, indent=2)
-        
+            json.dump({"profile": {"exit_type": "Normal", "exited_cleanly": True}}, f)
         log_ok(f"Created minimal profile at: {dst_root}")
         return dst_root
 
-    # Copy existing profile
     log_info(f"Copying {CHROME_PROFILE} → {dst_root}")
     shutil.copytree(
         src, dst_profile,
@@ -405,9 +421,7 @@ def _copy_profile_for_automation(refresh: bool = False) -> str:
 
 
 def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subprocess.Popen[bytes]":
-    # Detect if running in CI/CD environment
     is_ci = os.environ.get("CI") == "true" or os.environ.get("GITHUB_ACTIONS") == "true"
-    
     args = [
         chrome_exe,
         f"--user-data-dir={user_data_dir}",
@@ -424,8 +438,6 @@ def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subproces
         "--disable-dev-shm-usage",
         "--no-sandbox",
     ]
-    
-    # Add CI-specific flags
     if is_ci:
         args.extend([
             "--disable-gpu",
@@ -436,27 +448,18 @@ def _launch_chrome(chrome_exe: str, user_data_dir: str, port: int) -> "subproces
             "--disable-translate",
             "--metrics-recording-only",
             "--mute-audio",
-            "--no-sandbox",
             "--disable-setuid-sandbox",
         ])
-    
     args.append("about:blank")
-    
-    return subprocess.Popen(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 async def _wait_for_debug_endpoint(port: int, timeout: int = 45) -> dict:
     url  = f"http://127.0.0.1:{port}/json/version"
     loop = asyncio.get_running_loop()
-    
     log_info(f"Waiting for Chrome debug endpoint on port {port}...")
     start_time = time.time()
-    
-    for attempt in range(timeout * 4):  # check every 250 ms
+    for attempt in range(timeout * 4):
         try:
             result = await loop.run_in_executor(
                 None,
@@ -465,14 +468,12 @@ async def _wait_for_debug_endpoint(port: int, timeout: int = 45) -> dict:
             elapsed = time.time() - start_time
             log_ok(f"Chrome debug endpoint ready after {elapsed:.1f}s")
             return result
-        except Exception as e:
-            if attempt % 20 == 0 and attempt > 0:  # Log every 5 seconds
+        except Exception:
+            if attempt % 20 == 0 and attempt > 0:
                 elapsed = time.time() - start_time
                 log_info(f"Still waiting for Chrome... ({elapsed:.1f}s)")
             await asyncio.sleep(0.25)
-    
     elapsed = time.time() - start_time
-    log_err(f"Chrome debug endpoint timeout after {elapsed:.1f}s")
     raise TimeoutError(f"Chrome debug endpoint never opened on port {port} after {elapsed:.1f}s")
 
 
@@ -484,18 +485,50 @@ async def _debug_endpoint_is_open(port: int) -> bool:
         return False
 
 
+# ═══════════════════════════════════════════════════════════════
+# BROWSER STARTUP  –  Browserbase first, local Chrome fallback
+# ═══════════════════════════════════════════════════════════════
+
 async def _start_controlled_browser(
     args: argparse.Namespace,
     chrome_exe: str,
-) -> tuple[Any, Any]:
-    """Exact replica of start_controlled_browser() from extract_primesrc_urls.py."""
-    import nodriver as uc  # type: ignore[import]
+) -> tuple[Any, Any, str | None]:
+    """
+    Returns (browser, local_process, bb_session_id).
+    bb_session_id is set only when using Browserbase.
+    """
+    import nodriver as uc
 
+    bb_api_key    = os.environ.get("BROWSERBASE_API_KEY", "").strip()
+    bb_project_id = os.environ.get("BROWSERBASE_PROJECT_ID", "").strip()
+
+    # ── Browserbase path ──────────────────────────────────────────
+    if bb_api_key and bb_project_id:
+        log_info("Browserbase credentials detected — using cloud browser")
+        session    = _bb_create_session(bb_api_key, bb_project_id)
+        session_id = session["id"]
+        ws_url     = session.get("connectUrl") or session.get("wsUrl", "")
+
+        if not ws_url:
+            raise RuntimeError(
+                f"Browserbase session created but no connectUrl returned: {session}"
+            )
+
+        log_info(f"Connecting nodriver to Browserbase WebSocket...")
+        log_info(f"  WS URL: {ws_url[:80]}...")
+
+        # nodriver connects via the remote WebSocket endpoint
+        browser = await uc.start(browser_wsEndpoint=ws_url)
+        log_ok("Connected to Browserbase cloud browser")
+        return browser, None, session_id
+
+    # ── Local Chrome fallback ─────────────────────────────────────
+    log_info("No Browserbase credentials — using local Chrome")
     port = args.port
 
     if await _debug_endpoint_is_open(port):
         log_info(f"Reusing open automation Chrome on port {port}")
-        return await uc.start(host="127.0.0.1", port=port), None
+        return await uc.start(host="127.0.0.1", port=port), None, None
 
     if args.live_profile:
         user_data_dir = CHROME_USER_DATA
@@ -516,13 +549,14 @@ async def _start_controlled_browser(
             process.terminate()
         raise
 
-    return await uc.start(host="127.0.0.1", port=port), process
+    return await uc.start(host="127.0.0.1", port=port), process, None
 
 
-# ── JSON / URL helpers (identical to extract_primesrc_urls.py) ──
+# ═══════════════════════════════════════════════════════════════
+# JSON / URL HELPERS
+# ═══════════════════════════════════════════════════════════════
 
 def extract_json(text: str) -> Any:
-    """Copied verbatim from extract_primesrc_urls.py."""
     text = (text or "").strip()
     if not text:
         raise ValueError("Empty page content")
@@ -536,7 +570,6 @@ def extract_json(text: str) -> Any:
 
 
 def get_play_url(data: Any) -> str | None:
-    """Copied verbatim from extract_primesrc_urls.py."""
     if isinstance(data, dict):
         for key in ("link", "url", "file", "src", "stream"):
             v = data.get(key)
@@ -560,13 +593,8 @@ def get_play_url(data: Any) -> str | None:
     return None
 
 
-# ── Fast JSON waiter (copied verbatim from extract_primesrc_urls.py) ──
-
-async def wait_for_json_fast(page: Any, timeout: int = 45, blank_timeout: int = 1) -> str:
-    """
-    Poll every 100 ms; bail out as soon as body starts with { or [.
-    Copied verbatim from extract_primesrc_urls.py.
-    """
+async def wait_for_json_fast(page: Any, timeout: int = 60, blank_timeout: int = 1) -> str:
+    """Poll every 100 ms; bail out as soon as body starts with { or [."""
     deadline = time.monotonic() + timeout
     started  = time.monotonic()
     last_text = ""
@@ -589,7 +617,6 @@ async def wait_for_json_fast(page: Any, timeout: int = 45, blank_timeout: int = 
         except Exception:
             pass
 
-        # Status line every ~5 s
         if tick % 50 == 0:
             elapsed = int(time.monotonic() - (deadline - timeout))
             try:
@@ -598,10 +625,12 @@ async def wait_for_json_fast(page: Any, timeout: int = 45, blank_timeout: int = 
             except Exception:
                 print(f"      [{elapsed:02d}s] waiting…")
 
-    return last_text   # return whatever we have on timeout
+    return last_text
 
 
-# ── Per-tab worker (copied verbatim from extract_primesrc_urls.py) ──
+# ═══════════════════════════════════════════════════════════════
+# PER-TAB WORKER
+# ═══════════════════════════════════════════════════════════════
 
 _print_lock: asyncio.Lock | None = None
 
@@ -621,16 +650,10 @@ async def extract_one(
     index: int,
     total: int,
 ) -> dict[str, Any]:
-    """
-    Open one tab, reload on failure, then close it.
-    Semaphore controls concurrency.
-    Copied verbatim from extract_primesrc_urls.py — including new_tab=True.
-    """
     async with sem:
         label = f"[{index:>3}/{total}]"
         await safe_print(f"{label} → {api_url}")
 
-        # *** THE KEY FIX: new_tab=True — each URL gets its own fresh tab ***
         try:
             page = await browser.get(api_url, new_tab=True)
         except Exception as e:
@@ -641,19 +664,16 @@ async def extract_one(
         try:
             for attempt in range(reloads + 1):
                 if attempt:
-                    await safe_print(f"{label} ↻ immediate reload {attempt}/{reloads}")
+                    await safe_print(f"{label} ↻ reload {attempt}/{reloads}")
                     await page.reload(ignore_cache=True)
                     await asyncio.sleep(0.2)
 
                 try:
                     text = await wait_for_json_fast(
-                        page,
-                        timeout=timeout,
-                        blank_timeout=blank_timeout,
+                        page, timeout=timeout, blank_timeout=blank_timeout,
                     )
 
                     if not text or text[0] not in "{[":
-                        # innerHTML fallback (rare — Chrome <pre>-wrapped JSON)
                         text = await page.evaluate("document.body.innerHTML")
 
                     data     = extract_json(text)
@@ -709,7 +729,7 @@ async def process_batch(
     return await asyncio.gather(*tasks)
 
 
-async def _close_browser(browser: Any, proc: Any) -> None:
+async def _close_browser(browser: Any, proc: Any, bb_api_key: str, bb_session_id: str | None) -> None:
     try:
         log_info("Closing browser…")
         browser.stop()
@@ -721,16 +741,20 @@ async def _close_browser(browser: Any, proc: Any) -> None:
             proc.terminate()
         except Exception:
             pass
+    if bb_session_id and bb_api_key:
+        _bb_stop_session(bb_api_key, bb_session_id)
 
 
-# ── Stage 2 main runner (mirrors run() in extract_primesrc_urls.py) ──
+# ═══════════════════════════════════════════════════════════════
+# STAGE 2 MAIN RUNNER
+# ═══════════════════════════════════════════════════════════════
 
 async def stage2_extract_stream_urls(
     api_list_file: Path,
     stream_out_file: Path,
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
-    log_head("STAGE 2  –  Resolve keys → stream/embed URLs via Chrome")
+    log_head("STAGE 2  –  Resolve keys → stream/embed URLs")
 
     global _print_lock
     _print_lock = asyncio.Lock()
@@ -744,23 +768,27 @@ async def stage2_extract_stream_urls(
         log_warn("api_url_list.txt is empty – nothing to resolve in Stage 2.")
         return []
 
+    bb_api_key = os.environ.get("BROWSERBASE_API_KEY", "").strip()
+    using_bb   = bool(bb_api_key and os.environ.get("BROWSERBASE_PROJECT_ID", "").strip())
+
+    log_info(f"Browser backend     : {'Browserbase (cloud)' if using_bb else 'Local Chrome'}")
     log_info(f"API keys to resolve : {len(api_urls)}")
     log_info(f"Batch size          : {args.batch_size}")
     log_info(f"Reloads per tab     : {args.reloads}")
     log_info(f"Final retry passes  : {args.final_retries}")
     log_info(f"Tab timeout         : {args.timeout}s")
 
-    chrome_exe = _get_chrome_exe()
+    chrome_exe = "N/A (Browserbase)" if using_bb else _get_chrome_exe()
     log_info(f"Chrome              : {chrome_exe}")
 
-    log_info("Starting Chrome…")
-    browser, chrome_process = await _start_controlled_browser(args, chrome_exe)
+    log_info("Starting browser…")
+    browser, chrome_process, bb_session_id = await _start_controlled_browser(args, chrome_exe)
 
     t_start = time.monotonic()
     results: list[dict[str, Any]] = []
 
     try:
-        # Warm-up: first URL alone (mirrors extract_primesrc_urls.py)
+        # Warm-up: first URL alone
         results.extend(await process_batch(
             browser, [(1, api_urls[0])], len(api_urls),
             args.timeout, args.blank_timeout, args.reloads,
@@ -768,8 +796,8 @@ async def stage2_extract_stream_urls(
         ))
 
         # Remaining URLs in batches
-        remaining    = list(enumerate(api_urls[1:], 2))
-        batch_total  = (len(remaining) + args.batch_size - 1) // args.batch_size
+        remaining   = list(enumerate(api_urls[1:], 2))
+        batch_total = (len(remaining) + args.batch_size - 1) // args.batch_size
         for batch_num, start in enumerate(range(0, len(remaining), args.batch_size), 1):
             batch = remaining[start : start + args.batch_size]
             results.extend(await process_batch(
@@ -778,7 +806,7 @@ async def stage2_extract_stream_urls(
                 f"Batch {batch_num}/{batch_total}",
             ))
 
-        # Final retry passes for still-failed URLs
+        # Final retry passes
         for attempt in range(1, args.final_retries + 1):
             failed = [
                 (item["index"], item["api_url"])
@@ -802,7 +830,7 @@ async def stage2_extract_stream_urls(
 
     finally:
         if not args.keep_open:
-            await _close_browser(browser, chrome_process)
+            await _close_browser(browser, chrome_process, bb_api_key, bb_session_id)
 
     results.sort(key=lambda r: r.get("index", 0))
 
@@ -819,21 +847,23 @@ async def stage2_extract_stream_urls(
 
     log_info(f"Success : {len(ok)} / {len(results)}    Failed : {len(fails)}")
 
+    # Write plain text output
+    stream_out_file.write_text(
+        "\n".join(r["extracted_url"] for r in ok) + "\n",
+        encoding="utf-8",
+    )
+
     return results
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUMMARY — JSON + HTML report
+# TMDB TITLE LOOKUP
 # ═══════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════
-# TMDB TITLE LOOKUP  (no API key needed — uses public endpoint)
-# ═══════════════════════════════════════════════════════════════
+TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"
 
-TMDB_API_KEY = "6fad3f86b8452ee232deb7977d7dcf58"   # optional: set your v3 key here for faster lookups
 
 def _tmdb_request(path: str) -> dict:
-    """Make a TMDB API request. Uses API key if set."""
     base = "https://api.themoviedb.org/3"
     sep  = "&" if "?" in path else "?"
     url  = f"{base}{path}{sep}language=en-US"
@@ -852,19 +882,13 @@ def _tmdb_request(path: str) -> dict:
 
 
 def _fetch_tmdb_info(tmdb_id: str) -> tuple[str, str]:
-    """
-    Returns (title, imdb_id) for a given TMDB movie ID.
-    Hits /movie/{id} for title and /movie/{id}/external_ids for imdb_id.
-    Falls back to ("", None) on any error.
-    """
     title   = ""
     imdb_id = None
     try:
         data    = _tmdb_request(f"/movie/{tmdb_id}")
         title   = data.get("title") or data.get("original_title") or ""
-        imdb_id = data.get("imdb_id") or None   # already "tt..." format
+        imdb_id = data.get("imdb_id") or None
         if not imdb_id:
-            # fallback: external_ids endpoint
             ext     = _tmdb_request(f"/movie/{tmdb_id}/external_ids")
             imdb_id = ext.get("imdb_id") or None
     except Exception as exc:
@@ -877,77 +901,48 @@ def _fetch_tmdb_info(tmdb_id: str) -> tuple[str, str]:
 # ═══════════════════════════════════════════════════════════════
 
 def _to_gz_b64_json(pretty_path: Path, gz_path: Path) -> None:
-    """Read pretty JSON → gzip-compress → base64-encode → save as JSON wrapper."""
-    raw   = pretty_path.read_bytes()
-    gz    = gzip.compress(raw, compresslevel=9)
-    b64   = base64.b64encode(gz).decode("ascii")
-    wrapper = {
-        "encoding":    "gzip+base64",
-        "source_file": pretty_path.name,
-        "compressed":  b64,
-    }
+    raw     = pretty_path.read_bytes()
+    gz      = gzip.compress(raw, compresslevel=9)
+    b64     = base64.b64encode(gz).decode("ascii")
+    wrapper = {"encoding": "gzip+base64", "source_file": pretty_path.name, "compressed": b64}
     gz_path.write_text(json.dumps(wrapper, ensure_ascii=False), encoding="utf-8")
-    log_ok(
-        f"Compressed JSON → {gz_path}  "
-        f"({len(raw):,} B → {len(gz):,} B gz → {len(b64):,} B b64)"
-    )
+    log_ok(f"Compressed JSON → {gz_path}  ({len(raw):,} B → {len(gz):,} B gz → {len(b64):,} B b64)")
 
 
 # ═══════════════════════════════════════════════════════════════
-# SUMMARY WRITER  (pretty JSON  +  gzip/base64 JSON)
+# SUMMARY WRITER
 # ═══════════════════════════════════════════════════════════════
 
 def _format_summary_json(records: list[dict[str, Any]]) -> str:
-    """
-    Serialise the summary list to JSON with a custom layout:
-      - Each record's header fields (serial, title, tmdb_id …) are on their own lines.
-      - Each host-N / url-N *pair* is kept on a single line:
-          "host-1": "dood.watch", "url-1": "https://…"
-    The result is valid JSON (readable by json.loads) even though it isn't
-    produced by the standard indent= formatter.
-    """
     import re as _re
 
     def _jv(v: Any) -> str:
-        """JSON-encode a scalar value."""
         return json.dumps(v, ensure_ascii=False)
 
     lines: list[str] = ["["]
     for rec_idx, rec in enumerate(records):
         lines.append("  {")
-        # Collect keys in order; separate header keys from host-N/url-N pairs
         header_keys = ["serial", "title", "tmdb_id", "imdb_id", "extracted_at"]
-        # Find how many source pairs exist
-        n_sources = sum(1 for k in rec if _re.fullmatch(r"host-\d+", k))
+        n_sources   = sum(1 for k in rec if _re.fullmatch(r"host-\d+", k))
 
         all_field_lines: list[str] = []
-
-        # Header fields
         for hk in header_keys:
             if hk in rec:
                 all_field_lines.append(f'    {_jv(hk)}: {_jv(rec[hk])}')
 
-        # Source pairs — host-N and url-N on the same line
         for n in range(1, n_sources + 1):
-            hkey = f"host-{n}"
-            ukey = f"url-{n}"
+            hkey      = f"host-{n}"
+            ukey      = f"url-{n}"
             host_part = f'{_jv(hkey)}: {_jv(rec.get(hkey, ""))}'
             url_part  = f'{_jv(ukey)}: {_jv(rec.get(ukey, ""))}'
             all_field_lines.append(f"    {host_part}, {url_part}")
 
-        # Join with commas; last field of last record has no trailing comma
         is_last_rec = rec_idx == len(records) - 1
         for fi, fl in enumerate(all_field_lines):
             is_last_field = fi == len(all_field_lines) - 1
-            if is_last_field:
-                lines.append(fl)          # no comma after last field in object
-            else:
-                lines.append(fl + ",")
+            lines.append(fl if is_last_field else fl + ",")
 
-        if is_last_rec:
-            lines.append("  }")
-        else:
-            lines.append("  },")
+        lines.append("  }" if is_last_rec else "  },")
 
     lines.append("]")
     return "\n".join(lines) + "\n"
@@ -957,13 +952,11 @@ def _write_summary(
     stage1_options: list[ServerOption],
     stage2_results: list[dict[str, Any]],
     json_path: Path,
-    html_path: Path,  # kept for CLI compat — not used
+    html_path: Path,
 ) -> None:
     link_map = {r["api_url"]: r.get("extracted_url") or "" for r in stage2_results}
 
-    # ── 1. group new sources by tmdb_id ──────────────────────────
     new_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    tmdb_to_main: dict[str, str] = {}
     for opt in stage1_options:
         stream_url = link_map.get(opt.api_url, "")
         if not stream_url:
@@ -973,9 +966,7 @@ def _write_summary(
         if not tmdb:
             continue
         new_groups[tmdb].append({"host": urlparse(stream_url).netloc, "url": stream_url})
-        tmdb_to_main.setdefault(tmdb, opt.main_url)
 
-    # ── 2. load existing pretty JSON (if any) ────────────────────
     existing: list[dict[str, Any]] = []
     if json_path.exists():
         try:
@@ -985,15 +976,10 @@ def _write_summary(
             log_info(f"Loaded {len(existing)} existing entries from {json_path}")
         except Exception as exc:
             log_warn(f"Could not load existing JSON ({exc}) — starting fresh")
-            existing = []
 
-    # ── 3. upsert: merge new into existing keyed by tmdb_id ──────
-    # One entry per movie; sources stored internally as a list,
-    # deduplicated by url.
     index: dict[int, dict[str, Any]] = {}
     for e in existing:
         tmdb_int = e["tmdb_id"]
-        # Reconstruct internal sources list from flat host-N / url-N keys
         sources: list[dict[str, str]] = []
         n = 1
         while f"host-{n}" in e:
@@ -1004,19 +990,18 @@ def _write_summary(
             "imdb_id":      e.get("imdb_id"),
             "title":        e.get("title", ""),
             "extracted_at": e["extracted_at"],
-            "_sources":     sources,   # internal list, not written to JSON
+            "_sources":     sources,
         }
 
-    extracted_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    extracted_at    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     tmdb_meta_cache: dict[int, tuple[str, Any]] = {}
 
     for tmdb_str, new_sources in new_groups.items():
         tmdb_int = int(tmdb_str)
-
         if tmdb_int in index:
-            entry = index[tmdb_int]
+            entry        = index[tmdb_int]
             existing_urls = {s["url"] for s in entry["_sources"]}
-            added = [s for s in new_sources if s["url"] not in existing_urls]
+            added        = [s for s in new_sources if s["url"] not in existing_urls]
             entry["_sources"].extend(added)
             entry["extracted_at"] = extracted_at
             log_info(f"  tmdb={tmdb_int} — merged {len(added)} new source(s)")
@@ -1037,12 +1022,10 @@ def _write_summary(
             }
             log_ok(f"  tmdb={tmdb_int} — '{title}'  sources: {len(new_sources)}")
 
-    # ── 4. sort by tmdb_id, assign serial numbers ─────────────────
     sorted_entries = sorted(index.values(), key=lambda x: x["tmdb_id"])
     for i, entry in enumerate(sorted_entries, 1):
         entry["serial"] = i
 
-    # ── 5. build flat output: host-1/url-1, host-2/url-2, … ───────
     output: list[dict[str, Any]] = []
     for e in sorted_entries:
         row: dict[str, Any] = {
@@ -1057,15 +1040,11 @@ def _write_summary(
             row[f"url-{n}"]  = src["url"]
         output.append(row)
 
-    # ── 6. write pretty JSON  (host-N and url-N on the same line) ──
     json_path.write_text(_format_summary_json(output), encoding="utf-8")
     log_ok(f"Pretty JSON → {json_path}")
-    total_sources = sum(
-        sum(1 for k in row if k.startswith("url-")) for row in output
-    )
+    total_sources = sum(sum(1 for k in row if k.startswith("url-")) for row in output)
     log_info(f"Movies : {len(output)}   Sources : {total_sources}")
 
-    # ── 7. write gzip/base64 JSON alongside the pretty one ───────
     gz_path = json_path.with_suffix("").with_suffix(".gz.json")
     _to_gz_b64_json(json_path, gz_path)
 
@@ -1076,29 +1055,22 @@ def _write_summary(
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="PrimeSrc unified pipeline: embed URLs → API keys → stream URLs"
+        description="PrimeSrc unified pipeline (Browserbase edition)"
     )
-    # Paths
-    p.add_argument("--input",       type=Path, default=DEFAULT_INPUT_FILE)
-    p.add_argument("--api-list",    type=Path, default=DEFAULT_API_LIST)
-    p.add_argument("--output",      type=Path, default=DEFAULT_STREAM_OUT)
-    p.add_argument("--json-out",    type=Path, default=DEFAULT_JSON_SUMMARY)
-    p.add_argument("--html-out",    type=Path, default=DEFAULT_HTML_OUT)
-    # Pipeline control
-    p.add_argument("--skip-stage1", action="store_true",
-                   help="Skip Stage 1; use existing api_url_list.txt")
-    p.add_argument("--skip-stage2", action="store_true",
-                   help="Skip Stage 2; only collect keys, no Chrome")
-    p.add_argument("--type",        choices=("movie", "tv"), default="movie")
-    # Chrome / Stage 2 (mirrors extract_primesrc_urls.py args exactly)
+    p.add_argument("--input",           type=Path, default=DEFAULT_INPUT_FILE)
+    p.add_argument("--api-list",        type=Path, default=DEFAULT_API_LIST)
+    p.add_argument("--output",          type=Path, default=DEFAULT_STREAM_OUT)
+    p.add_argument("--json-out",        type=Path, default=DEFAULT_JSON_SUMMARY)
+    p.add_argument("--html-out",        type=Path, default=DEFAULT_HTML_OUT)
+    p.add_argument("--skip-stage1",     action="store_true")
+    p.add_argument("--skip-stage2",     action="store_true")
+    p.add_argument("--type",            choices=("movie", "tv"), default="movie")
     p.add_argument("--port",            type=int, default=CHROME_DEBUG_PORT)
     p.add_argument("--timeout",         type=int, default=STAGE2_PAGE_TIMEOUT)
     p.add_argument("--blank-timeout",   type=int, default=STAGE2_BLANK_TIMEOUT)
-    p.add_argument("--batch-size",      type=int, default=STAGE2_BATCH_SIZE,
-                   dest="batch_size")
+    p.add_argument("--batch-size",      type=int, default=STAGE2_BATCH_SIZE, dest="batch_size")
     p.add_argument("--reloads",         type=int, default=STAGE2_RELOADS)
-    p.add_argument("--final-retries",   type=int, default=STAGE2_FINAL_RETRIES,
-                   dest="final_retries")
+    p.add_argument("--final-retries",   type=int, default=STAGE2_FINAL_RETRIES, dest="final_retries")
     p.add_argument("--live-profile",    action="store_true", dest="live_profile")
     p.add_argument("--kill-chrome",     action="store_true", dest="kill_chrome")
     p.add_argument("--refresh-profile", action="store_true", dest="refresh_profile")
@@ -1107,15 +1079,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 async def _run(args: argparse.Namespace) -> int:
-    log_head("PrimeSRC UNIFIED PIPELINE")
+    log_head("PrimeSRC UNIFIED PIPELINE  (Browserbase edition)")
     log_info(f"Input   : {args.input}")
     log_info(f"API list: {args.api_list}")
     log_info(f"Output  : {args.output}")
 
+    bb_key = os.environ.get("BROWSERBASE_API_KEY", "")
+    bb_pid = os.environ.get("BROWSERBASE_PROJECT_ID", "")
+    if bb_key and bb_pid:
+        log_ok("Browserbase credentials found — cloud browser will be used")
+    else:
+        log_warn("No Browserbase credentials — falling back to local Chrome")
+
     stage1_options: list[ServerOption] = []
     stage2_results: list[dict[str, Any]] = []
 
-    # Stage 1
     if args.skip_stage1:
         log_info("Stage 1 skipped — using existing api_url_list.txt")
     else:
@@ -1124,7 +1102,6 @@ async def _run(args: argparse.Namespace) -> int:
             return 1
         stage1_options = stage1_fetch_api_keys(args.input, args.api_list, args.type)
 
-    # Stage 2
     if args.skip_stage2:
         log_info("Stage 2 skipped.")
     else:
@@ -1139,10 +1116,8 @@ async def _run(args: argparse.Namespace) -> int:
             log_err("nodriver not installed.  Run:  pip install nodriver")
             return 2
 
-    # Summary
     if stage1_options or stage2_results:
         if not stage1_options and args.api_list.exists():
-            # Reconstruct stubs when stage1 was skipped
             for line in args.api_list.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
                 if not line or line.startswith("#"):
