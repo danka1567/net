@@ -281,8 +281,10 @@ def _bb_create_session(api_key, project_id):
                 "operatingSystems": ["windows"],
                 "locales":          ["en-US"],
             },
-            "viewport": {"width": 1280, "height": 800},
+            "viewport": {"width": 1920, "height": 1080},
+            "solveCaptchas": True,  # Enable Browserbase's captcha solving
         },
+        "proxies": True,  # Use Browserbase's residential proxies to avoid detection
     })
     log_ok(f"Browserbase session created: {session['id']}")
     return session
@@ -349,8 +351,26 @@ async def _extract_urls_browserbase(api_urls, args):
 
                 page = await context.new_page()
                 try:
+                    # Set extra headers to look more like a real browser
+                    await page.set_extra_http_headers({
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Upgrade-Insecure-Requests": "1",
+                        "Sec-Fetch-Dest": "document",
+                        "Sec-Fetch-Mode": "navigate",
+                        "Sec-Fetch-Site": "none",
+                    })
+                    
                     # Wait for the page to load and get JSON
                     response = await page.goto(api_url, timeout=args.timeout * 1000, wait_until="domcontentloaded")
+
+                    # Wait extra time if Cloudflare challenge is detected
+                    initial_content = await page.content()
+                    if any(indicator in initial_content.lower() for indicator in 
+                           ["cloudflare", "just a moment", "checking your browser", "enable cookies"]):
+                        print(f"{label} ⏳ Cloudflare challenge detected, waiting 15s...")
+                        await asyncio.sleep(15)  # Wait for Browserbase to solve it
 
                     # Poll for JSON content
                     deadline = time.monotonic() + args.timeout
@@ -365,8 +385,11 @@ async def _extract_urls_browserbase(api_urls, args):
                             title = await page.title()
                             # Check for Cloudflare or bot detection
                             if any(indicator in title.lower() for indicator in ["just a moment", "checking your browser", "cloudflare"]):
-                                await asyncio.sleep(1)  # Wait longer for challenge
+                                await asyncio.sleep(2)  # Wait longer for challenge
                                 continue
+                            # Check if still showing cookie error
+                            if "enable cookies" in text.lower() or "been blocked" in text.lower():
+                                continue  # Keep waiting
                             if text:
                                 break
                         except Exception:
@@ -401,9 +424,14 @@ async def _extract_urls_browserbase(api_urls, args):
                     last_error = str(e)
                     print(f"{label} ✗ {last_error}")
                     
+                    # If browser/context was closed, we can't continue
+                    if "closed" in last_error.lower() or "target" in last_error.lower():
+                        print(f"{label} ⚠ Browser context closed, cannot retry")
+                        break
+                    
                     # Detect rate limiting or blocking
                     if any(indicator in last_error.lower() for indicator in 
-                           ["rate limit", "too many requests", "cloudflare", "html", "error page"]):
+                           ["rate limit", "too many requests", "cloudflare", "html", "error page", "blocked", "cookies"]):
                         consecutive_errors += 1
                         error_delay = min(error_delay * STAGE2_ERROR_BACKOFF, STAGE2_MAX_ERROR_DELAY)  # Exponential backoff
                         print(f"{label} ⚠ Possible rate limit detected, adding {error_delay:.1f}s delay")
